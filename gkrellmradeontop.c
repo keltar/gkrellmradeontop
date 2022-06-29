@@ -233,7 +233,7 @@ static void load_config(gchar *arg) {
 
 	if(!strcmp(config_keyword, "extra_info")) {
 		sscanf(config_data, "%d\n", &gpu_mon.extra_info);
-	} else if(!strcmp(config_data, GKRELLM_CHARTCONFIG_KEYWORD)) {
+	} else if(!strcmp(config_keyword, GKRELLM_CHARTCONFIG_KEYWORD)) {
 		gkrellm_load_chartconfig(&gpu_mon.chart_config, config_data, 1);
 	}
 }
