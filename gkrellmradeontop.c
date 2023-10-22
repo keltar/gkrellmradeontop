@@ -3,6 +3,9 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "subprocess.h"
 
 #define PLUGIN_NAME "gkrellmradeontop"
 #define PLUGIN_DESC "show AMD GPU load chart"
@@ -40,7 +43,9 @@ static struct {
 	pthread_mutex_t mutex;
 	struct {
 		pthread_t thread;
-		FILE *popen_pipe;
+		struct subprocess_s subprocess;
+		bool subprocess_running;
+		bool stop_thread;
 	} radeontop;
 
 	struct gpu_stats gpu_stats, gpu_stats_copy;
@@ -69,19 +74,51 @@ static float radeontop_extract_stat(const char *str, char *label) {
 	return 0;
 }
 
+static void stop_helper_process(void) {
+	pthread_mutex_lock(&gpu_mon.mutex);
+	if(gpu_mon.radeontop.thread) {
+		gpu_mon.radeontop.stop_thread = true;
+		if(gpu_mon.radeontop.subprocess_running) {
+			subprocess_terminate(&gpu_mon.radeontop.subprocess);
+			gpu_mon.radeontop.subprocess_running = false;
+		}
+	}
+	pthread_mutex_unlock(&gpu_mon.mutex);
+	pthread_join(gpu_mon.radeontop.thread, NULL);
+	gpu_mon.radeontop.thread = 0;
+}
+
 static void *radeontop_thread(void *arg) {
 	(void)arg;
 
 	memset(&gpu_mon.gpu_stats, 0, sizeof(gpu_mon.gpu_stats));
+	gpu_mon.radeontop.stop_thread = false;
 
 	while(1) {
-		FILE *p = popen("radeontop -d -", "r");
-		if(!p) {
+		/* early check for thread exit. Could happen if both radeontop and
+		 * gkrellm got int/term signal. This still could potentially trigger a
+		 * deadlock, although chances of that happening are very low.
+		 * Proper fix should do a read timeout and re-check thread stop flag, or
+		 * pthread_timedwait_np() and re-kill subprocess.
+		 * FIXME */
+		pthread_mutex_lock(&gpu_mon.mutex);
+		if(gpu_mon.radeontop.stop_thread) {
+			pthread_mutex_unlock(&gpu_mon.mutex);
+			break;
+		}
+
+		// FIXME make path and args configurable
+		const char *cmdline[] = {"/usr/bin/radeontop", "-d", "-", NULL};
+		int result = subprocess_create(cmdline, 0, &gpu_mon.radeontop.subprocess);
+		if(result != 0) {
 			fprintf(stderr, "can't launch radeontop");
 			return NULL;
 		}
+		gpu_mon.radeontop.subprocess_running = true;
+		gpu_mon.radeontop.stop_thread = false;
+		pthread_mutex_unlock(&gpu_mon.mutex);
 
-		gpu_mon.radeontop.popen_pipe = p;
+		FILE *p = subprocess_stdout(&gpu_mon.radeontop.subprocess);
 
 		char buffer[512];
 
@@ -102,11 +139,22 @@ static void *radeontop_thread(void *arg) {
 			}
 		}
 
+		if(subprocess_join(&gpu_mon.radeontop.subprocess, NULL) != 0) {
+			fprintf(stderr, "subprocess_join failed, killing process\n");
+			subprocess_terminate(&gpu_mon.radeontop.subprocess);
+		}
+
+		pthread_mutex_lock(&gpu_mon.mutex);
+		gpu_mon.radeontop.subprocess_running = false;
+		bool brk = gpu_mon.radeontop.stop_thread;
+		pthread_mutex_unlock(&gpu_mon.mutex);
+
+		if(brk) {
+			break;
+		}
+
 		fprintf(stderr, "radeontop is finished, restarting in 5 seconds\n");
-
-		pclose(p);
-
-		sleep(5);
+		sleep(5);	// TODO should this be configurable? define'd?
 	}
 
 	return NULL;
@@ -154,7 +202,7 @@ static gint mouseclick_event(GtkWidget *widget, GdkEventButton *ev) {
 	return FALSE;
 }
 
-static void setup_scaling(GkrellmChartconfig *cf, GkrellmChart *cp) {
+static void setup_scaling(GkrellmChartconfig *cf, void *cp) {
 	(void)cp;
 	gkrellm_set_chartconfig_auto_grid_resolution(cf, FALSE);
 	gkrellm_set_chartconfig_grid_resolution(cf, SCALE_MAX / FULL_SCALE_GRIDS);
@@ -165,7 +213,8 @@ static void create_plugin(GtkWidget *vbox, gint first_create) {
 
 	if(first_create) {
 		pthread_mutex_init(&gpu_mon.mutex, NULL);
-		pthread_create(&gpu_mon.radeontop.thread, NULL, &radeontop_thread, NULL);
+		gkrellm_disable_plugin_connect(gpu_plugin_mon_ptr, &stop_helper_process);
+		atexit(&stop_helper_process);
 
 		gpu_mon.vbox = gtk_vbox_new(FALSE, 0);
 		gtk_container_add(GTK_CONTAINER(vbox), gpu_mon.vbox);
@@ -176,6 +225,10 @@ static void create_plugin(GtkWidget *vbox, gint first_create) {
 	} else {
 		gkrellm_destroy_decal_list(gpu_mon.chart->panel);
 		gkrellm_destroy_krell_list(gpu_mon.chart->panel);
+	}
+
+	if(!gpu_mon.radeontop.thread) {
+		pthread_create(&gpu_mon.radeontop.thread, NULL, &radeontop_thread, NULL);
 	}
 
 	GkrellmStyle *style = gkrellm_panel_style(style_id);
