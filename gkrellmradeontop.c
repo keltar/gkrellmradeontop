@@ -17,6 +17,9 @@
 #define MIN_GRID_RES 10
 #define MAX_GRID_RES 100
 
+#define CMDLINE_MAX_LEN 1024
+#define RADEONTOP_DEFAULT_CMDLINE "/usr/bin/radeontop -d - -t 1"
+
 //#define DBGPRINTF(fmt, ...) fprintf(stderr, (fmt), __VA_ARGS__)
 #define DBGPRINTF(fmt, ...)
 
@@ -49,11 +52,43 @@ static struct {
 	} radeontop;
 
 	struct gpu_stats gpu_stats, gpu_stats_copy;
+
+	struct {
+		GtkWidget *radeontop_cmdline_entry;
+		char radeontop_cmdline[CMDLINE_MAX_LEN];
+	} options;
 } gpu_mon;
 
 static gint style_id;
 
 static GkrellmMonitor *gpu_plugin_mon_ptr;
+
+static void extract_cmdline(const char **out, size_t max, char *buf, const char *in) {
+	// TODO add support for quoted arguments with spaces inside
+	strcpy(buf, in);
+	size_t len = strlen(buf);
+	size_t idx = 0, cur_len = 0;
+	for(size_t i = 0; i < len+1; ++i) {
+		if(buf[i] == '\0' || isspace(buf[i])) {
+			buf[i] = '\0';
+			if(cur_len > 0) {
+				if(idx < max) {
+					out[idx] = &buf[i-cur_len];
+				}
+				idx++;
+			}
+			cur_len = 0;
+			continue;
+		}
+
+		cur_len++;
+	}
+	if(idx < max) {
+		out[idx] = 0;
+	} else {
+		out[max-1] = 0;
+	}
+}
 
 static float radeontop_extract_stat(const char *str, char *label) {
 	const char *m = strstr(str, label);
@@ -107,8 +142,11 @@ static void *radeontop_thread(void *arg) {
 			break;
 		}
 
-		// FIXME make path and args configurable
-		const char *cmdline[] = {"/usr/bin/radeontop", "-d", "-", NULL};
+		char cmdline_buf[CMDLINE_MAX_LEN];
+		const char *cmdline[128];
+		extract_cmdline(cmdline, sizeof(cmdline)/sizeof(cmdline[0]),
+				cmdline_buf, gpu_mon.options.radeontop_cmdline);
+
 		int result = subprocess_create(cmdline, 0, &gpu_mon.radeontop.subprocess);
 		if(result != 0) {
 			fprintf(stderr, "can't launch radeontop");
@@ -267,16 +305,48 @@ static void create_plugin(GtkWidget *vbox, gint first_create) {
 	}
 }
 
-static void create_plugin_tab(GtkWidget *vbox) {
-	(void)vbox;
+static void create_plugin_tab(GtkWidget *tabs_vbox) {
+	GtkWidget *tabs = gtk_notebook_new();
+	gtk_notebook_set_tab_pos(GTK_NOTEBOOK(tabs), GTK_POS_TOP);
+	gtk_box_pack_start(GTK_BOX(tabs_vbox), tabs, TRUE, TRUE, 0);
+
+	GtkWidget *vbox = gkrellm_gtk_framed_notebook_page(tabs, _("Setup"));
+	GtkWidget *vbox1 = gkrellm_gtk_framed_vbox(vbox, _("Launch Options"), 4, FALSE, 0, 2);
+
+	GtkWidget *hbox = gtk_hbox_new(FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(vbox1), hbox, FALSE, FALSE, 0);
+	GtkWidget *label = gtk_label_new(_("radeontop options"));
+	gtk_box_pack_start(GTK_BOX(hbox), label, TRUE, TRUE, 0);
+	gpu_mon.options.radeontop_cmdline_entry = gtk_entry_new();
+	if(strlen(gpu_mon.options.radeontop_cmdline) > 0) {
+		gtk_entry_set_text(GTK_ENTRY(gpu_mon.options.radeontop_cmdline_entry),
+				gpu_mon.options.radeontop_cmdline);
+	}
+	gtk_box_pack_start(GTK_BOX(hbox), gpu_mon.options.radeontop_cmdline_entry, TRUE, TRUE, 8);
+
+	label = gtk_label_new(_("default options are \"" RADEONTOP_DEFAULT_CMDLINE "\""));
+	gtk_box_pack_start(GTK_BOX(vbox1), label, TRUE, TRUE, 0);
 }
 
 static void apply_config(void) {
+	if(gpu_mon.options.radeontop_cmdline_entry) {
+		g_strlcpy(gpu_mon.options.radeontop_cmdline,
+				gtk_entry_get_text(GTK_ENTRY(gpu_mon.options.radeontop_cmdline_entry)),
+				sizeof(gpu_mon.options.radeontop_cmdline));
+	}
+
+	// restart process to apply new args
+	pthread_mutex_lock(&gpu_mon.mutex);
+	if(gpu_mon.radeontop.subprocess_running) {
+		subprocess_terminate(&gpu_mon.radeontop.subprocess);
+	}
+	pthread_mutex_unlock(&gpu_mon.mutex);
 }
 
 static void save_config(FILE *f) {
 	gkrellm_save_chartconfig(f, gpu_mon.chart_config, PLUGIN_KEYWORD, NULL);
 	fprintf(f, "%s extra_info %d\n", PLUGIN_KEYWORD, gpu_mon.extra_info);
+	fprintf(f, "%s radeontop_cmdline %s\n", PLUGIN_KEYWORD, gpu_mon.options.radeontop_cmdline);
 }
 
 static void load_config(gchar *arg) {
@@ -288,6 +358,9 @@ static void load_config(gchar *arg) {
 		sscanf(config_data, "%d\n", &gpu_mon.extra_info);
 	} else if(!strcmp(config_keyword, GKRELLM_CHARTCONFIG_KEYWORD)) {
 		gkrellm_load_chartconfig(&gpu_mon.chart_config, config_data, 1);
+	} else if(!strcmp(config_keyword, "radeontop_cmdline")) {
+		g_strlcpy(gpu_mon.options.radeontop_cmdline, config_data,
+				sizeof(gpu_mon.options.radeontop_cmdline));
 	}
 }
 
@@ -338,6 +411,11 @@ static GkrellmMonitor gpu_plugin_mon = {
 };
 
 GkrellmMonitor *gkrellm_init_plugin(void) {
+	// set default options
+	g_strlcpy(gpu_mon.options.radeontop_cmdline,
+			RADEONTOP_DEFAULT_CMDLINE,
+			sizeof(gpu_mon.options.radeontop_cmdline));
+
 	gpu_plugin_mon_ptr = &gpu_plugin_mon;
 	style_id = gkrellm_add_chart_style(gpu_plugin_mon_ptr, PLUGIN_NAME);
 	return gpu_plugin_mon_ptr;
